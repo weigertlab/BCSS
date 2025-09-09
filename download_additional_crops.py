@@ -23,7 +23,7 @@ except ImportError:
 CWD = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, CWD)
 
-from utils import create_directory_structure, printNlog, get_image_from_htk_response
+from utils import create_directory_structure, printNlog, get_image_from_htk_response, has_excessive_white_background
 import configs as cf
 
 # Configuration imported from configs.py
@@ -37,6 +37,9 @@ def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, z
     
     # Create zarr group
     zarr_group = zarr.open_group(zarr_path, mode='w')
+    
+    # Set up Blosc compression
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
     
     scales = [1, 2, 4]  # Scale factors for each level
     
@@ -70,6 +73,11 @@ def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, z
             image = get_image_from_htk_response(resp)
             image_array = np.array(image)
             
+            # Apply white background filter on the first level (highest resolution)
+            if level == 0 and cf_config.ENABLE_WHITE_BACKGROUND_FILTER:
+                if has_excessive_white_background(image, cf_config.WHITE_BACKGROUND_THRESHOLD, cf_config.MAX_WHITE_PERCENTAGE):
+                    raise ValueError("Excessive white background detected")
+            
             # Ensure consistent output size
             if image_array.shape[:2] != (crop_size, crop_size):
                 from PIL import Image as PILImage
@@ -77,14 +85,15 @@ def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, z
                 image_pil = image_pil.resize((crop_size, crop_size), PILImage.LANCZOS)
                 image_array = np.array(image_pil)
             
-            # Save to zarr
-            zarr_group.create_dataset(str(level), data=image_array, chunks=(512, 512, 3), dtype=image_array.dtype)
+            # Save to zarr with compression
+            zarr_group.create_dataset(str(level), data=image_array, chunks=(512, 512, 3), 
+                                    dtype=image_array.dtype, compressor=compressor)
             
         except Exception as e:
             printNlog(f"Error downloading level {level} (scale {scale}x): {e}", level='error')
             # Fill with zeros if download fails
             zarr_group.create_dataset(str(level), data=np.zeros((crop_size, crop_size, 3), dtype=np.uint8), 
-                                    chunks=(512, 512, 3), dtype=np.uint8)
+                                    chunks=(512, 512, 3), dtype=np.uint8, compressor=compressor)
     
     # Add metadata for multiscale
     zarr_group.attrs['multiscales'] = [{
@@ -168,7 +177,7 @@ def download_additional_crops(crop_size=None, output_type='png'):
     
     # Create output directory
     dir_suffix = '_zarr' if output_type == 'zarr' else ''
-    additional_crops_dir = os.path.join(cf.SAVEPATH, f'additional_crops{dir_suffix}')
+    additional_crops_dir = cf.SAVEPATH
     os.makedirs(additional_crops_dir, exist_ok=True)
     
     # Get all slides
@@ -241,13 +250,26 @@ def download_additional_crops(crop_size=None, output_type='png'):
                     resp = gc.get(getStr, jsonResp=False)
                     rgb = get_image_from_htk_response(resp)
                     
+                    # Apply white background filter if enabled
+                    if cf.ENABLE_WHITE_BACKGROUND_FILTER:
+                        if has_excessive_white_background(rgb, cf.WHITE_BACKGROUND_THRESHOLD, cf.MAX_WHITE_PERCENTAGE):
+                            printNlog(f"    Skipping crop {crop_idx} - excessive white background")
+                            continue
+                    
                     filepath = os.path.join(additional_crops_dir, filename + ".png")
                     rgb.save(filepath)
                     
                 elif output_type == 'zarr':
                     # For zarr, use multiscale download approach
                     filepath = os.path.join(additional_crops_dir, filename + ".zarr")
-                    download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size if crop_size else crop_width, filepath, cf)
+                    try:
+                        download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size if crop_size else crop_width, filepath, cf)
+                    except ValueError as e:
+                        if "Excessive white background detected" in str(e):
+                            printNlog(f"    Skipping crop {crop_idx} - excessive white background")
+                            continue
+                        else:
+                            raise
                 
                 # Store metadata
                 crop_metadata.append({

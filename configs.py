@@ -29,3 +29,25 @@ PIPELINE = (
 # if you only want to download data for specific slides
 SLIDES_TO_KEEP = None
 # SLIDES_TO_KEEP = ['TCGA-BH-A1FC', 'TCGA-A8-A07C', 'TCGA-A1-A0SK']
+
+# =============================================================================
+# Additional crop settings (for download_additional_crops.py)
+# =============================================================================
+
+# Target crop size (similar to annotated crops)
+ADDITIONAL_CROP_WIDTH = 5000   # pixels at base resolution
+ADDITIONAL_CROP_HEIGHT = 4300  # pixels at base resolution
+
+# Number of random crops per slide
+CROPS_PER_SLIDE = 3
+
+# Minimum distance from slide edges (to avoid empty regions)
+EDGE_MARGIN = 10000  # pixels
+
+# Random seed for reproducible sampling
+RANDOM_SEED = 42
+
+# White background filtering settings
+ENABLE_WHITE_BACKGROUND_FILTER = True
+WHITE_BACKGROUND_THRESHOLD = 200  # Pixel values above this are considered "white"
+MAX_WHITE_PERCENTAGE = 40  # Maximum allowed percentage of white pixels
