@@ -129,8 +129,107 @@ def get_slide_dimensions(gc, slide_id):
         printNlog(f"Error getting dimensions for slide {slide_id}: {e}", level='error')
         return 0, 0
 
+def download_slide_overview(gc, slide_id, target_size=1000):
+    """Download a low-resolution overview of the entire slide for tissue detection"""
+    try:
+        # Get slide dimensions
+        props = gc.get(f'item/{slide_id}/tiles')
+        slide_width = props.get('sizeX', 0)
+        slide_height = props.get('sizeY', 0)
+        
+        if slide_width == 0 or slide_height == 0:
+            return None, 0, 0
+        
+        # Calculate downsampling to get roughly target_size on longest dimension
+        scale_factor = max(slide_width, slide_height) / target_size
+        overview_width = int(slide_width / scale_factor)
+        overview_height = int(slide_height / scale_factor)
+        
+        # Download overview at low resolution
+        getStr = f"/item/{slide_id}/tiles/region?left=0&right={slide_width}&top=0&bottom={slide_height}&width={overview_width}&height={overview_height}"
+        
+        resp = gc.get(getStr, jsonResp=False)
+        overview_image = get_image_from_htk_response(resp)
+        
+        return overview_image, scale_factor, (slide_width, slide_height)
+        
+    except Exception as e:
+        printNlog(f"Error downloading slide overview: {e}", level='error')
+        return None, 0, 0
+
+def create_tissue_mask(overview_image, white_threshold=200):
+    """Create a binary mask identifying tissue regions (non-white areas)"""
+    # Convert to numpy array
+    overview_array = np.array(overview_image)
+    
+    # Create tissue mask (inverse of white background detection)
+    if len(overview_array.shape) == 3:
+        # For RGB images, tissue is where NOT all channels are above threshold
+        tissue_mask = ~np.all(overview_array > white_threshold, axis=2)
+    else:
+        # For grayscale images
+        tissue_mask = overview_array <= white_threshold
+    
+    return tissue_mask
+
+def sample_tissue_coordinates(tissue_mask, scale_factor, slide_dims, crop_width, crop_height, margin, n_crops, max_attempts=1000):
+    """Sample crop coordinates from tissue regions using the tissue mask"""
+    crops = []
+    slide_width, slide_height = slide_dims
+    
+    # Ensure we have enough space for crops
+    max_x = slide_width - crop_width - margin
+    max_y = slide_height - crop_height - margin
+    
+    if max_x <= margin or max_y <= margin:
+        printNlog(f"Slide too small for crops: {slide_width}x{slide_height}", level='error')
+        return crops
+    
+    # Get tissue pixel coordinates in overview space
+    tissue_coords = np.where(tissue_mask)
+    if len(tissue_coords[0]) == 0:
+        printNlog("No tissue regions found in slide overview", level='error')
+        return crops
+    
+    attempts = 0
+    while len(crops) < n_crops and attempts < max_attempts:
+        attempts += 1
+        
+        # Randomly select a tissue pixel from the overview
+        idx = random.randint(0, len(tissue_coords[0]) - 1)
+        overview_y = tissue_coords[0][idx]
+        overview_x = tissue_coords[1][idx]
+        
+        # Convert overview coordinates back to full resolution
+        center_x = int(overview_x * scale_factor)
+        center_y = int(overview_y * scale_factor)
+        
+        # Calculate crop bounds centered on tissue region
+        half_width = crop_width // 2
+        half_height = crop_height // 2
+        xmin = center_x - half_width
+        ymin = center_y - half_height
+        xmax = center_x + half_width
+        ymax = center_y + half_height
+        
+        # Check if crop fits within slide bounds with margin
+        if (xmin >= margin and ymin >= margin and 
+            xmax <= slide_width - margin and ymax <= slide_height - margin):
+            
+            crops.append({
+                'xmin': xmin,
+                'ymin': ymin,
+                'xmax': xmax,
+                'ymax': ymax
+            })
+    
+    if len(crops) < n_crops:
+        printNlog(f"Could only find {len(crops)} valid tissue regions out of {n_crops} requested after {attempts} attempts")
+    
+    return crops
+
 def generate_random_crop_coordinates(slide_width, slide_height, crop_width, crop_height, margin, n_crops):
-    """Generate random crop coordinates ensuring they fit within slide bounds"""
+    """Generate random crop coordinates ensuring they fit within slide bounds (fallback method)"""
     crops = []
     
     # Ensure we have enough space for crops
@@ -222,12 +321,49 @@ def download_additional_crops(crop_size=None, output_type='png', compression='bl
         
         printNlog(f"Slide dimensions: {slide_width} x {slide_height}")
         
-        # Generate random crop coordinates
-        crops = generate_random_crop_coordinates(
-            slide_width, slide_height, 
-            crop_width, crop_height, 
-            cf.EDGE_MARGIN, cf.CROPS_PER_SLIDE
-        )
+        # Choose sampling strategy based on configuration
+        if cf.ENABLE_TISSUE_AWARE_SAMPLING:
+            # Download slide overview for tissue detection
+            printNlog("  Downloading slide overview for tissue detection...")
+            overview_image, scale_factor, slide_dims = download_slide_overview(gc, slide_id, target_size=cf.OVERVIEW_SIZE)
+            
+            if overview_image is None:
+                printNlog(f"Skipping slide {slide_name} - could not download overview", level='error')
+                continue
+            
+            # Save overview to logs for inspection
+            log_dir = os.path.join(cf.SAVEPATH, 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            overview_path = os.path.join(log_dir, f"{slide_name}_overview.jpg")
+            overview_image.save(overview_path, "JPEG", quality=85)
+            printNlog(f"  Saved overview to {overview_path}")
+            
+            # Create tissue mask from overview
+            tissue_mask = create_tissue_mask(overview_image, cf.WHITE_BACKGROUND_THRESHOLD)
+            
+            # Sample crop coordinates from tissue regions
+            crops = sample_tissue_coordinates(
+                tissue_mask, scale_factor, slide_dims,
+                crop_width, crop_height, 
+                cf.EDGE_MARGIN, cf.CROPS_PER_SLIDE,
+                max_attempts=cf.MAX_SAMPLING_ATTEMPTS
+            )
+            
+            # Fallback to random sampling if tissue sampling fails
+            if not crops:
+                printNlog("  Falling back to random coordinate sampling...")
+                crops = generate_random_crop_coordinates(
+                    slide_width, slide_height, 
+                    crop_width, crop_height, 
+                    cf.EDGE_MARGIN, cf.CROPS_PER_SLIDE
+                )
+        else:
+            # Use original random sampling approach
+            crops = generate_random_crop_coordinates(
+                slide_width, slide_height, 
+                crop_width, crop_height, 
+                cf.EDGE_MARGIN, cf.CROPS_PER_SLIDE
+            )
         
         if not crops:
             printNlog(f"Skipping slide {slide_name} - no valid crop regions", level='error')

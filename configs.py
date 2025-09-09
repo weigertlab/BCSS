@@ -51,3 +51,8 @@ RANDOM_SEED = 42
 ENABLE_WHITE_BACKGROUND_FILTER = True
 WHITE_BACKGROUND_THRESHOLD = 200  # Pixel values above this are considered "white"
 MAX_WHITE_PERCENTAGE = 40  # Maximum allowed percentage of white pixels
+
+# Tissue-aware sampling settings
+ENABLE_TISSUE_AWARE_SAMPLING = True  # Use slide overview for intelligent crop sampling
+OVERVIEW_SIZE = 1000  # Target size for slide overview (pixels on longest dimension)
+MAX_SAMPLING_ATTEMPTS = 1000  # Maximum attempts to find tissue regions before giving up

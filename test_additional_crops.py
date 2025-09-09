@@ -15,7 +15,7 @@ import configs as cf
 from download_additional_crops import download_additional_crops, parse_arguments
 
 # Test with just a single slide
-cf.SLIDES_TO_KEEP = ['TCGA-A1-A0SK']
+cf.SLIDES_TO_KEEP = ['TCGA-A2-A04Q']
 cf.CROPS_PER_SLIDE = 1  # Just 1 crop per slide for testing
 
 if __name__ == '__main__':
@@ -32,6 +32,9 @@ if __name__ == '__main__':
         print(f"Using default crop size from config: {cf.ADDITIONAL_CROP_WIDTH}x{cf.ADDITIONAL_CROP_HEIGHT}")
     
     print(f"Output format: {args.type}")
+    
+    cf.SAVEPATH = 'tests'
+    cf.CROPS_PER_SLIDE = 5
     
     download_additional_crops(
         crop_size=args.size, 
