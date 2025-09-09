@@ -311,8 +311,15 @@ Examples:
     parser.add_argument(
         '--type',
         choices=['png', 'zarr'],
-        default='png',
+        default='zarr',
         help='Output format: "png" for PNG images or "zarr" for multiscale zarr3 format with 1x/2x/4x downsampling'
+    )
+
+    parser.add_argument(
+        '-o', '--outdir',
+        type=str,
+        default=None,
+        help='Root output directory to write results and logs (overrides configs.SAVEPATH)'
     )
     
     return parser.parse_args()
@@ -325,6 +332,10 @@ def main():
     # Override config if specified
     if args.crops_per_slide is not None:
         cf.CROPS_PER_SLIDE = args.crops_per_slide
+
+    # Override save path if outdir is provided
+    if getattr(args, 'outdir', None):
+        cf.SAVEPATH = args.outdir
         
     # Setup logging
     now = str(datetime.datetime.now()).replace(' ', '_').replace(':', '_')
