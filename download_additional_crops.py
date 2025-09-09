@@ -10,6 +10,7 @@ import csv
 import numpy as np
 import random
 import argparse
+import shutil
 from PIL import Image
 try:
     import zarr
@@ -30,44 +31,55 @@ import configs as cf
 
 # =============================================================================
 
-def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, zarr_path, cf_config):
+def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, zarr_path, cf_config, compression='blosc'):
     """Download and save multiscale zarr with same shape but different context"""
     if not ZARR_AVAILABLE:
         raise ImportError("zarr, dask, and scikit-image are required for zarr output. Install with: pip install zarr dask[array] scikit-image")
     
-    # Create zarr group
-    zarr_group = zarr.open_group(zarr_path, mode='w')
-    
-    # Set up Blosc compression
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
-    
-    scales = [1, 2, 4]  # Scale factors for each level
-    
-    for level, scale in enumerate(scales):
-        # Calculate region size for this level (larger area at lower resolution)
-        region_size = crop_size * scale
-        half_size = region_size // 2
+    zarr_group = None
+    try:
+        # Create zarr group (v3 compatible)
+        zarr_group = zarr.open_group(zarr_path, mode='w')
         
-        # Calculate bounds centered on the same coordinate
-        xmin = center_x - half_size
-        ymin = center_y - half_size
-        xmax = center_x + half_size
-        ymax = center_y + half_size
+        # Set up compression based on parameter (v3 compatible)
+        if compression == 'blosc':
+            try:
+                from zarr.codecs import BloscCodec
+                compressor = BloscCodec(cname='zstd', clevel=3, shuffle='shuffle')
+            except ImportError:
+                printNlog("Warning: BloscCodec not available, using no compression", level='error')
+                compressor = None
+        elif compression == 'none' or compression is None:
+            compressor = None
+        else:
+            raise ValueError(f"Unsupported compression type: {compression}. Use 'none' or 'blosc'.")
         
-        # Build API request for this level
-        getStr = f"/item/{slide_id}/tiles/region?left={xmin}&right={xmax}&top={ymin}&bottom={ymax}"
+        scales = [1, 2, 4]  # Scale factors for each level
         
-        # Add resolution specification
-        if cf_config.MPP is not None:
-            mm = 0.001 * cf_config.MPP
-            getStr += f"&mm_x={mm:.4f}&mm_y={mm:.4f}"
-        elif cf_config.MAG is not None:
-            getStr += f"&magnification={cf_config.MAG:.2f}"
-        
-        # Force output size to be consistent across levels
-        getStr += f"&width={crop_size}&height={crop_size}"
-        
-        try:
+        for level, scale in enumerate(scales):
+            # Calculate region size for this level (larger area at lower resolution)
+            region_size = crop_size * scale
+            half_size = region_size // 2
+            
+            # Calculate bounds centered on the same coordinate
+            xmin = center_x - half_size
+            ymin = center_y - half_size
+            xmax = center_x + half_size
+            ymax = center_y + half_size
+            
+            # Build API request for this level
+            getStr = f"/item/{slide_id}/tiles/region?left={xmin}&right={xmax}&top={ymin}&bottom={ymax}"
+            
+            # Add resolution specification
+            if cf_config.MPP is not None:
+                mm = 0.001 * cf_config.MPP
+                getStr += f"&mm_x={mm:.4f}&mm_y={mm:.4f}"
+            elif cf_config.MAG is not None:
+                getStr += f"&magnification={cf_config.MAG:.2f}"
+            
+            # Force output size to be consistent across levels
+            getStr += f"&width={crop_size}&height={crop_size}"
+            
             # Download the crop for this level
             resp = gc.get(getStr, jsonResp=False)
             image = get_image_from_htk_response(resp)
@@ -85,31 +97,28 @@ def download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size, z
                 image_pil = image_pil.resize((crop_size, crop_size), PILImage.LANCZOS)
                 image_array = np.array(image_pil)
             
-            # Save to zarr with compression
-            zarr_group.create_dataset(str(level), data=image_array, chunks=(512, 512, 3), 
-                                    dtype=image_array.dtype, compressor=compressor)
-            
-        except Exception as e:
-            printNlog(f"Error downloading level {level} (scale {scale}x): {e}", level='error')
-            # Fill with zeros if download fails
-            zarr_group.create_dataset(str(level), data=np.zeros((crop_size, crop_size, 3), dtype=np.uint8), 
-                                    chunks=(512, 512, 3), dtype=np.uint8, compressor=compressor)
-    
-    # Add metadata for multiscale
-    zarr_group.attrs['multiscales'] = [{
-        'version': '0.4',
-        'name': 'image',
-        'axes': [
-            {'name': 'y', 'type': 'space'},
-            {'name': 'x', 'type': 'space'}, 
-            {'name': 'c', 'type': 'channel'}
-        ],
-        'datasets': [
-            {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1.0, 1.0, 1.0]}]},
-            {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [2.0, 2.0, 1.0]}]},
-            {'path': '2', 'coordinateTransformations': [{'type': 'scale', 'scale': [4.0, 4.0, 1.0]}]}
-        ]
-    }]
+            # Save to zarr - v3 compatible
+            if compressor is not None:
+                zarr_group.create_array(f's{str(level)}', data=image_array, chunks=(512, 512, 3), 
+                                      compressor=compressor)
+            else:
+                zarr_group.create_array(f's{str(level)}', data=image_array, chunks=(512, 512, 3))
+        
+        # Add metadata for multiscale (simplified for v3)
+        zarr_group.attrs['multiscales'] = [{
+            'version': '0.4',
+            'datasets': [
+                {'path': '0'},
+                {'path': '1'}, 
+                {'path': '2'}
+            ]
+        }]
+        
+    except Exception as e:
+        # If any error occurs, clean up the zarr directory
+        if os.path.exists(zarr_path):
+            shutil.rmtree(zarr_path)
+        raise e
 
 def get_slide_dimensions(gc, slide_id):
     """Get slide dimensions from HistomicsTK API"""
@@ -147,7 +156,7 @@ def generate_random_crop_coordinates(slide_width, slide_height, crop_width, crop
     
     return crops
 
-def download_additional_crops(crop_size=None, output_type='png'):
+def download_additional_crops(crop_size=None, output_type='png', compression='blosc', nfiles=None):
     """Download additional crops from TCGA slides without masks"""
     
     # Determine crop dimensions
@@ -188,6 +197,12 @@ def download_additional_crops(crop_size=None, output_type='png'):
     slide_list = list(slides.keys())
     if cf.SLIDES_TO_KEEP is not None:
         slide_list = [j for j in slide_list if j in cf.SLIDES_TO_KEEP]
+    
+    # Limit number of slides if nfiles specified
+    if nfiles is not None:
+        slide_list = slide_list[:nfiles]
+    
+    
     
     printNlog(f"Processing {len(slide_list)} slides for additional crops")
     
@@ -263,7 +278,7 @@ def download_additional_crops(crop_size=None, output_type='png'):
                     # For zarr, use multiscale download approach
                     filepath = os.path.join(additional_crops_dir, filename + ".zarr")
                     try:
-                        download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size if crop_size else crop_width, filepath, cf)
+                        download_multiscale_zarr_crop(gc, slide_id, center_x, center_y, crop_size if crop_size else crop_width, filepath, cf, compression)
                     except ValueError as e:
                         if "Excessive white background detected" in str(e):
                             printNlog(f"    Skipping crop {crop_idx} - excessive white background")
@@ -336,12 +351,26 @@ Examples:
         default='zarr',
         help='Output format: "png" for PNG images or "zarr" for multiscale zarr3 format with 1x/2x/4x downsampling'
     )
+    
+    parser.add_argument(
+        '--compression',
+        choices=['none', 'blosc'],
+        default='none',
+        help='Compression method for zarr files: "none" for no compression, "blosc" for lossless compression (default)'
+    )
 
     parser.add_argument(
         '-o', '--outdir',
         type=str,
         default=None,
         help='Root output directory to write results and logs (overrides configs.SAVEPATH)'
+    )
+    
+    parser.add_argument(
+        '-n', '--nfiles',
+        type=int,
+        default=None,
+        help='Maximum number of files to download (default: None means download all)'
     )
     
     return parser.parse_args()
@@ -371,7 +400,7 @@ def main():
     )
     
     printNlog("Starting additional crop download")
-    download_additional_crops(crop_size=args.size, output_type=args.type)
+    download_additional_crops(crop_size=args.size, output_type=args.type, compression=args.compression, nfiles=args.nfiles)
     printNlog("Finished additional crop download")
 
 if __name__ == '__main__':
